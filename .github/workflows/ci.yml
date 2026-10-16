@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+
+      - name: Build (warnings are errors)
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: AddressSanitizer + UndefinedBehaviorSanitizer
+        run: |
+          cmake -S . -B build-asan -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON
+          cmake --build build-asan -j
+          ctest --test-dir build-asan --output-on-failure
+
+      - name: ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
+          cmake --build build-tsan -j
+          ctest --test-dir build-tsan --output-on-failure
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install network tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iputils-ping
+
+      - name: Build
+        run: cmake -S . -B build && cmake --build build -j
+
+      - name: Forwarding smoke test
+        run: sudo ./scripts/ci_integration.sh
