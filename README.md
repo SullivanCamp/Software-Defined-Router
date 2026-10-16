@@ -1,8 +1,8 @@
 # sdrouter
 
-A userspace software-defined router in C++20. It receives Ethernet frames on raw
+A userspace software-defined router in C++. It receives Ethernet frames on raw
 sockets, does a longest-prefix-match route lookup, rewrites the headers, and
-forwards them out another interface — while the control plane rewrites the
+forwards them out another interface - while the control plane rewrites the
 routing table underneath it, without stopping traffic.
 
 The architecture is the split real routers make:
@@ -58,50 +58,6 @@ sudo ./build/sdrouter -i rt1 -i rt2 -i rt3 -f /tmp/demo.conf
 Raw sockets need `CAP_NET_RAW`: run as root, or
 `sudo setcap cap_net_raw,cap_net_admin=eip ./build/sdrouter`.
 
-## Why C++ here, and what the language actually bought
-
-This started as a C implementation. The port was not a rename — each change below
-removed a class of bug rather than restating the same logic in different syntax.
-
-**`Published<T>` replaced two hand-written copies of the same algorithm.** In C,
-the clone/publish/reclaim dance was written out once for the routing table and
-again for the neighbor table, and the two copies had already started to drift.
-As a template it exists once, and `NeighborTable` picked up the identical
-concurrency guarantees by being copy-constructible. Adding a third published
-table is now a one-line declaration.
-
-**`std::optional<Route>` returned by value removed a real footgun.** The C
-`rt_lookup` returned a pointer into the trie, so every caller had to remember to
-copy the route out *before* releasing the RCU snapshot. Nothing enforced that.
-`lookup()` now returns by value, so the dangling-read is not expressible.
-
-**`std::variant<ParsedFrame, PacketError>` removed the ignorable error.** The C
-version returned a status enum and filled out-parameters; a caller could
-dereference the header without checking. The variant has no "valid" flag to
-forget.
-
-**`FileDescriptor` removed a leak.** The C interface-setup path had four early
-returns, and one of them leaked the socket. A move-only owning wrapper made that
-unrepresentable.
-
-**`Ipv4Address` and `Prefix` removed byte-order and canonicalization bugs.** An
-address was a bare `uint32_t` with the byte order documented in a comment.
-`host()` and `network()` are now separate accessors with no implicit conversion
-to an integer, and `Prefix` masks host bits in its constructor — so
-`10.0.0.7/24` and `10.0.0.0/24` are the *same object*, not two entries.
-
-**`std::jthread` + `stop_token` removed the shutdown flag.** No global
-`volatile sig_atomic_t`, no manual join loop; workers stop and join in the
-destructor.
-
-**`Qsbr::Guard` removed the pairing bug.** `begin()`/`end()` by hand is the one
-thing a reader can get wrong on an early return. RAII made it structural.
-
-The honest cost: the trie is `unique_ptr`-based, so cloning recurses through
-allocations rather than memcpy-ing a flat arena, and the deep-copy constructor is
-doing real work on every route update. That is the same tradeoff the C version
-made, just more visible.
-
 ## The concurrency design, and why not `atomic<shared_ptr>`
 
 The control plane must install a route while three data-plane threads are
@@ -112,7 +68,7 @@ Instead, `Published<T>::update` copies the table, mutates the copy, swaps the
 pointer with a release store, waits out a QSBR grace period, then frees the old
 one. Readers do two atomic stores and a load — no lock, no CAS, no allocation.
 
-C++20 offers `std::atomic<std::shared_ptr<const T>>`, which gets reclamation for
+C++ offers `std::atomic<std::shared_ptr<const T>>`, which gets reclamation for
 free and is the idiomatic answer. It was the obvious candidate for this port, so
 `tests/bench_snapshot.cpp` measures both rather than arguing about it:
 
@@ -123,8 +79,8 @@ atomic<shared_ptr>         13.77 M lookups/sec
 Published<T> (QSBR)        71.43 M lookups/sec
 ```
 
-Two things to note. `atomic<shared_ptr>` is **not lock-free** on libstdc++ — it
-falls back to a spinlock table — and every read touches a refcount, which is
+Two things to note. `atomic<shared_ptr>` is **not lock-free** on libstdc++, it
+falls back to a spinlock table, and every read touches a refcount, which is
 exactly the per-packet atomic RMW the design is trying to avoid. And this
 measurement is from a single-core container, which exaggerates contention; the
 ratio would compress on real hardware. The direction is what matters, and the
@@ -137,7 +93,7 @@ readers were not a bounded, registered set. Here they are exactly one per port.
 
 Per packet, `data_plane.cpp`:
 
-- ignores frames marked `PACKET_OUTGOING` — AF_PACKET echoes our own
+- ignores frames marked `PACKET_OUTGOING` - AF_PACKET echoes our own
   transmissions back, which would otherwise loop every forwarded frame
 - ignores `PACKET_OTHERHOST`; promiscuous mode delivers frames addressed to
   other stations, and a router forwards only what was sent to its own MAC
@@ -145,7 +101,7 @@ Per packet, `data_plane.cpp`:
   length, and the header checksum
 - drops at TTL ≤ 1 rather than forwarding a packet that dies on the next hop
 - decrements TTL and patches the checksum **incrementally** (RFC 1624) rather
-  than recomputing the header — constant work, and what real forwarding
+  than recomputing the header - constant work, and what real forwarding
   hardware does
 - refuses to send a packet back out the port it arrived on
 - trims Ethernet padding, forwarding exactly what IP's total length claims
@@ -181,8 +137,8 @@ make tsan    # rebuild under ThreadSanitizer, rerun
 
 Unit tests cover the address value types (including round-tripping host vs
 network order and rejecting malformed input), LPM semantics, `RouteTable` value
-semantics — that a copy is a deep clone, which is the property `Published<T>`
-depends on — the checksum helpers, including a proof that the incremental TTL
+semantics - that a copy is a deep clone, which is the property `Published<T>`
+depends on - the checksum helpers, including a proof that the incremental TTL
 update is byte-identical to a full recompute for every TTL from 2 to 255, and
 frame validation against runts, wrong EtherTypes, bad IHL, lying length fields,
 corrupted checksums, and padded frames.
@@ -196,18 +152,6 @@ up as a use-after-free.
 the reply TTL is 63 rather than 64 (proving sdrouter forwarded it and not the
 kernel), TTL=1 is dropped, and a live route withdrawal stops traffic while a
 reinstall resumes it. CI runs everything under both g++ and clang++.
-
-## What's deliberately not here
-
-- **ARP.** Neighbors are installed statically through the control protocol. An
-  ARP state machine is the obvious next step and does not disturb the
-  forwarding architecture.
-- **ICMP generation.** A real router answers TTL expiry with time-exceeded and
-  hairpins with a redirect. Here they are counted and dropped.
-- **Fragmentation.** Headers with options parse correctly (IHL is honored), but
-  nothing generates fragments.
-- **A routing protocol.** The control plane speaks its own protocol rather than
-  OSPF or BGP. The interface it exposes is the one a protocol daemon would use.
 
 ## Layout
 
